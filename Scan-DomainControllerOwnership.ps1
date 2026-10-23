@@ -1,47 +1,109 @@
-<#
+﻿<#
 .SYNOPSIS
-Scans domain controllers in a specified Active Directory domain and reports non-default object ownership.
+Scans domain controller computer objects in an Active Directory domain and reports non-default ownership.
 
 .DESCRIPTION
-This script enumerates all domain controllers in the provided domain, inspects the owner of each domain controller's
-computer object, and identifies objects that are not owned by Domain Admins or Enterprise Admins. For any deviations,
-it emits one-line remediation commands that will reset ownership to the Domain Admins group of the target domain.
+Finds every domain controller computer object in the target domain - writable DCs (primaryGroupID 516),
+read-only DCs (primaryGroupID 521) and any computer flagged as SERVER_TRUST_ACCOUNT - reads the owner from
+its nTSecurityDescriptor and checks that the owner is Domain Admins of the target domain or Enterprise
+Admins of the forest root domain.
+
+The owner of an object can always rewrite its permissions, so a non-privileged owner of a domain controller
+computer object is a direct path to domain compromise.
+
+The script only reads from Active Directory. It outputs one object per domain controller; objects with an
+unexpected owner include a one-line RemediationCommand that resets the owner to Domain Admins of the target
+domain. Review each command before running it.
+
+.PARAMETER Domain
+DNS name of the target domain (or the name of a domain controller in it). Used as -Server for all queries.
+
+.PARAMETER Credential
+Optional credential for the target domain. Generated remediation commands then reference a variable named
+$Credential, which must hold a suitable credential in the session where the commands are run.
 
 .EXAMPLE
-PS> .\Scan-DomainControllerOwnership.ps1 -Domain ad.contoso.com
+PS> .\Scan-DomainControllerOwnership.ps1 -Domain example.com
+
+Lists all domain controller computer objects with their owner and status.
 
 .EXAMPLE
-PS> $cred = Get-Credential
-PS> .\Scan-DomainControllerOwnership.ps1 -Domain ad.contoso.com -Credential $cred
+PS> $Credential = Get-Credential
+PS> .\Scan-DomainControllerOwnership.ps1 -Domain child.example.com -Credential $Credential
+
+Scans another domain with explicit credentials.
+
+.EXAMPLE
+PS> .\Scan-DomainControllerOwnership.ps1 -Domain example.com |
+        Where-Object Status -eq 'UnexpectedOwner' |
+        Select-Object -ExpandProperty RemediationCommand
+
+Prints only the remediation commands for objects with an unexpected owner.
+
+.OUTPUTS
+PSCustomObject with Name, DistinguishedName, Status (OK, UnexpectedOwner, OwnerUnreadable), Owner, OwnerSid
+and RemediationCommand.
 
 .NOTES
-Run from an elevated PowerShell session using a highly privileged (Tier 0) account that is a member of Domain Admins or
-Enterprise Admins in the target domain. The ActiveDirectory module must be available on the host running this script.
+Author : Łukasz Ślemp (https://github.com/aimarpl)
+Version: 1.1.0
+License: MIT
+
+Requirements:
+- Windows PowerShell 5.1 or PowerShell 7 with the ActiveDirectory module (RSAT).
+- Reading owners works with an ordinary domain account. Running the remediation commands requires
+  Domain Admins or Enterprise Admins rights (Tier 0) and should be done from a secure admin host.
+
+Exit codes:
+0 - All domain controller objects have an expected owner.
+1 - Error (module missing, domain unreachable, query failed).
+2 - At least one object has an unexpected or unreadable owner.
+
+Version history:
+1.1.0 - Fix parse error in the remediation command; read the owner SID correctly (the Owner property is a
+        string, so every DC was reported); find DCs by primaryGroupID/userAccountControl, including RODCs
+        and DC accounts without a server object; query the forest root domain on its own DC; output
+        objects instead of host text; remediation uses Set-ADObject against the target domain;
+        error handling and exit codes.
+1.0.0 - Initial version.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
     [string]$Domain,
 
     [Parameter(Mandatory = $false)]
     [System.Management.Automation.PSCredential]$Credential
 )
 
-function Get-AllowedOwnerSids {
+$ErrorActionPreference = 'Stop'
+
+function Get-AllowedOwnerSid {
     param(
-        [string]$Domain,
         [hashtable]$AdParams
     )
 
     $domainInfo = Get-ADDomain @AdParams
     $forestInfo = Get-ADForest @AdParams
-    $rootDomainInfo = Get-ADDomain -Identity $forestInfo.RootDomain @AdParams
+
+    if ($domainInfo.DNSRoot -eq $forestInfo.RootDomain) {
+        $rootDomainInfo = $domainInfo
+    }
+    else {
+        # Query the root domain on its own DC; a DC of a child domain cannot return it.
+        $rootParams = @{ Server = $forestInfo.RootDomain }
+        if ($AdParams.ContainsKey('Credential')) {
+            $rootParams.Credential = $AdParams.Credential
+        }
+        $rootDomainInfo = Get-ADDomain -Identity $forestInfo.RootDomain @rootParams
+    }
 
     $domainAdminsSid = "$($domainInfo.DomainSID)-512"
     $enterpriseAdminsSid = "$($rootDomainInfo.DomainSID)-519"
 
-    return [ordered]@{
-        Allowed = @($domainAdminsSid, $enterpriseAdminsSid) | Select-Object -Unique
+    [PSCustomObject]@{
+        Allowed   = @($domainAdminsSid, $enterpriseAdminsSid | Select-Object -Unique)
         Preferred = $domainAdminsSid
     }
 }
@@ -52,60 +114,116 @@ function Resolve-AccountName {
     )
 
     try {
-        return ([System.Security.Principal.SecurityIdentifier]$Sid).Translate([System.Security.Principal.NTAccount]).Value
+        ([System.Security.Principal.SecurityIdentifier]$Sid).Translate([System.Security.Principal.NTAccount]).Value
     }
     catch {
-        return $Sid
+        $Sid
     }
 }
 
-Import-Module ActiveDirectory -ErrorAction Stop
+function ConvertTo-QuotedLiteral {
+    # Single-quoted PowerShell literal; quote characters (including typographic ones) are doubled.
+    param(
+        [string]$Value
+    )
 
-$adParams = @{ Server = $Domain }
-if ($Credential) {
-    $adParams.Credential = $Credential
+    "'" + ($Value -replace '[''\u2018\u2019\u201A\u201B]', '$0$0') + "'"
 }
 
-$ownerInfo = Get-AllowedOwnerSids -Domain $Domain -AdParams $adParams
-$allowedOwners = $ownerInfo.Allowed
-$preferredOwner = $ownerInfo.Preferred
+function New-RemediationCommand {
+    param(
+        [string]$DistinguishedName,
+        [string]$OwnerSid,
+        [string]$Server,
+        [bool]$UseCredential
+    )
 
-$domainControllers = Get-ADDomainController -Filter * @adParams
+    $connection = " -Server $(ConvertTo-QuotedLiteral $Server)"
+    if ($UseCredential) {
+        $connection += ' -Credential $Credential'
+    }
 
-$unexpectedOwners = foreach ($dc in $domainControllers) {
-    $adObject = Get-ADObject -Identity $dc.ComputerObjectDN -Properties nTSecurityDescriptor @adParams
-    $ownerSid = $adObject.nTSecurityDescriptor.Owner.Value
+    $template = '$sd = (Get-ADObject -Identity {0} -Properties nTSecurityDescriptor{1}).nTSecurityDescriptor; ' +
+                '$sd.SetOwner([System.Security.Principal.SecurityIdentifier]{2}); ' +
+                'Set-ADObject -Identity {0} -Replace @{{ nTSecurityDescriptor = $sd }}{1}'
 
-    if ($allowedOwners -notcontains $ownerSid) {
+    $template -f (ConvertTo-QuotedLiteral $DistinguishedName), $connection, (ConvertTo-QuotedLiteral $OwnerSid)
+}
+
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false
+
+    $adParams = @{ Server = $Domain }
+    if ($Credential) {
+        $adParams.Credential = $Credential
+    }
+
+    $ownerInfo = Get-AllowedOwnerSid -AdParams $adParams
+    Write-Verbose "Allowed owners: $($ownerInfo.Allowed -join ', ')"
+
+    # Writable DCs (516), RODCs (521) and any account flagged SERVER_TRUST_ACCOUNT (0x2000). This also
+    # catches DC computer accounts that have no server object in Sites, which Get-ADDomainController misses.
+    $ldapFilter = '(|(primaryGroupID=516)(primaryGroupID=521)(userAccountControl:1.2.840.113556.1.4.803:=8192))'
+    $domainControllers = @(Get-ADComputer -LDAPFilter $ldapFilter -Properties dNSHostName, nTSecurityDescriptor @adParams |
+        Sort-Object -Property Name)
+
+    if ($domainControllers.Count -eq 0) {
+        throw "No domain controller computer objects found in domain '$Domain'."
+    }
+    Write-Verbose "Domain controller computer objects found in ${Domain}: $($domainControllers.Count)"
+
+    $results = foreach ($dc in $domainControllers) {
+        $name = if ($dc.dNSHostName) { $dc.dNSHostName } else { $dc.Name }
+        $ownerSid = $null
+        if ($dc.nTSecurityDescriptor) {
+            $ownerSid = $dc.nTSecurityDescriptor.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        }
+
+        if (-not $ownerSid) {
+            $status = 'OwnerUnreadable'
+            $owner = $null
+            $command = $null
+        }
+        elseif ($ownerInfo.Allowed -contains $ownerSid) {
+            $status = 'OK'
+            $owner = Resolve-AccountName -Sid $ownerSid
+            $command = $null
+        }
+        else {
+            $status = 'UnexpectedOwner'
+            $owner = Resolve-AccountName -Sid $ownerSid
+            $command = New-RemediationCommand -DistinguishedName $dc.DistinguishedName -OwnerSid $ownerInfo.Preferred `
+                -Server $Domain -UseCredential ([bool]$Credential)
+        }
+
         [PSCustomObject]@{
-            Name               = $dc.HostName
-            DistinguishedName  = $dc.ComputerObjectDN
+            Name               = $name
+            DistinguishedName  = $dc.DistinguishedName
+            Status             = $status
+            Owner              = $owner
             OwnerSid           = $ownerSid
-            Owner              = Resolve-AccountName -Sid $ownerSid
+            RemediationCommand = $command
         }
     }
+    $results = @($results)
+    $results
+
+    $unexpected = @($results | Where-Object { $_.Status -eq 'UnexpectedOwner' })
+    $unreadable = @($results | Where-Object { $_.Status -eq 'OwnerUnreadable' })
+
+    if ($unexpected.Count -gt 0) {
+        Write-Warning ("{0} of {1} domain controller object(s) have an unexpected owner. Validate each owner, then use the RemediationCommand property to reset it to Domain Admins." -f $unexpected.Count, $results.Count)
+    }
+    if ($unreadable.Count -gt 0) {
+        Write-Warning ("The owner of {0} object(s) could not be read; check permissions of the account running the scan." -f $unreadable.Count)
+    }
+
+    if ($unexpected.Count -gt 0 -or $unreadable.Count -gt 0) {
+        exit 2
+    }
+    exit 0
 }
-
-Write-Host "`nScan target domain: $Domain" -ForegroundColor Cyan
-Write-Host "Total domain controllers found: $($domainControllers.Count)"
-
-if (-not $unexpectedOwners) {
-    Write-Host "All domain controller computer objects are owned by default privileged groups (Domain Admins / Enterprise Admins)." -ForegroundColor Green
-    return
+catch {
+    Write-Error -ErrorAction Continue "Domain controller ownership scan failed: $($_.Exception.Message)"
+    exit 1
 }
-
-Write-Host "Domain controllers with unexpected ownership:" -ForegroundColor Yellow
-$unexpectedOwners | Format-Table Name, Owner, DistinguishedName -AutoSize
-
-Write-Host "`nRemediation commands (run individually):" -ForegroundColor Cyan
-foreach ($entry in $unexpectedOwners) {
-    $credentialFragment = if ($Credential) { " -Credential `$Credential" } else { "" }
-    $command = "$sd = (Get-ADObject -Identity `\"$($entry.DistinguishedName)`\" -Properties nTSecurityDescriptor -Server `\"$Domain`\"$credentialFragment).nTSecurityDescriptor; $sd.SetOwner([System.Security.Principal.SecurityIdentifier]`\"$preferredOwner`\"); Set-Acl -AclObject $sd -Path `\"AD:\\$($entry.DistinguishedName)`\""
-    Write-Host $command
-}
-
-Write-Host "`nExecution guidelines:" -ForegroundColor White
-Write-Host "- Run from an elevated PowerShell session on a secure management host." -ForegroundColor White
-Write-Host "- Use a Tier 0 account with Domain Admins or Enterprise Admins rights in the target domain." -ForegroundColor White
-Write-Host "- Ensure the ActiveDirectory module is installed and you can reach the domain controllers for $Domain." -ForegroundColor White
-Write-Host "- Execute each remediation command only after validating the unexpected owner is incorrect for your environment." -ForegroundColor White
