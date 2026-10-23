@@ -5,8 +5,8 @@ Scans domain controller computer objects in an Active Directory domain and repor
 .DESCRIPTION
 Finds every domain controller computer object in the target domain - writable DCs (primaryGroupID 516),
 read-only DCs (primaryGroupID 521) and any computer flagged as SERVER_TRUST_ACCOUNT - reads the owner from
-its nTSecurityDescriptor and checks that the owner is Domain Admins of the target domain or Enterprise
-Admins of the forest root domain.
+its nTSecurityDescriptor and checks that the owner is Domain Admins of the target domain, Enterprise Admins
+of the forest root domain or BUILTIN\Administrators.
 
 The owner of an object can always rewrite its permissions, so a non-privileged owner of a domain controller
 computer object is a direct path to domain compromise.
@@ -61,10 +61,10 @@ Exit codes:
 
 Version history:
 1.1.0 - Fix parse error in the remediation command; read the owner SID correctly (the Owner property is a
-        string, so every DC was reported); find DCs by primaryGroupID/userAccountControl, including RODCs
-        and DC accounts without a server object; query the forest root domain on its own DC; output
-        objects instead of host text; remediation uses Set-ADObject against the target domain;
-        error handling and exit codes.
+        string, so every DC was reported); accept BUILTIN\Administrators as owner; find DCs by
+        primaryGroupID/userAccountControl, including RODCs and DC accounts without a server object; query
+        the forest root domain on its own DC; output objects instead of host text; remediation uses
+        Set-ADObject against the target domain; error handling and exit codes.
 1.0.0 - Initial version.
 #>
 [CmdletBinding()]
@@ -101,9 +101,10 @@ function Get-AllowedOwnerSid {
 
     $domainAdminsSid = "$($domainInfo.DomainSID)-512"
     $enterpriseAdminsSid = "$($rootDomainInfo.DomainSID)-519"
+    $builtinAdministratorsSid = 'S-1-5-32-544'
 
     [PSCustomObject]@{
-        Allowed   = @($domainAdminsSid, $enterpriseAdminsSid | Select-Object -Unique)
+        Allowed   = @($domainAdminsSid, $enterpriseAdminsSid, $builtinAdministratorsSid | Select-Object -Unique)
         Preferred = $domainAdminsSid
     }
 }

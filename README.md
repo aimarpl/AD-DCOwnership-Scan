@@ -2,7 +2,7 @@
 
 `Scan-DomainControllerOwnership.ps1` checks who owns the domain controller computer objects in an
 Active Directory domain and reports every object that is not owned by Domain Admins (of the target
-domain) or Enterprise Admins (of the forest root domain).
+domain), Enterprise Admins (of the forest root domain) or BUILTIN\Administrators.
 
 The owner of an AD object can always rewrite its permissions. A domain controller computer object owned
 by an ordinary user or a helpdesk/deployment account is therefore a direct path to domain compromise.
@@ -56,7 +56,7 @@ on one object first.
   `SERVER_TRUST_ACCOUNT` flag in `userAccountControl`. This also catches DC computer accounts that have
   no server object in Sites and are therefore missing from `Get-ADDomainController`.
 - The owner SID is read from `nTSecurityDescriptor` and compared with the Domain Admins SID of the target
-  domain and the Enterprise Admins SID of the forest root domain.
+  domain, the Enterprise Admins SID of the forest root domain and BUILTIN\Administrators (S-1-5-32-544).
 - Objects whose security descriptor cannot be read are reported as `OwnerUnreadable`.
 
 ## Output
