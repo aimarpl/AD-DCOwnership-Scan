@@ -1,5 +1,9 @@
 # AD-DCOwnership-Scan
 
+[![PowerShell 5.1 | 7](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE?logo=powershell&logoColor=white)](https://learn.microsoft.com/powershell/)
+[![Module: ActiveDirectory](https://img.shields.io/badge/module-ActiveDirectory-0078D4)](https://learn.microsoft.com/powershell/module/activedirectory/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 `Scan-DomainControllerOwnership.ps1` checks who owns the domain controller computer objects in an
 Active Directory domain and reports every object that is not owned by Domain Admins (of the target
 domain), Enterprise Admins (of the forest root domain) or BUILTIN\Administrators.
